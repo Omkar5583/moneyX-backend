@@ -32,11 +32,29 @@ async function parseSMS(smsBody) {
   const response = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      {
+      
+        {
         role: "system",
-        content: `You are a bank SMS parser. Extract transaction details and return ONLY valid JSON.
-No explanation, no markdown, just JSON.
-Format: {"merchant":"name","amount":number,"category":"Food Delivery|Shopping|Subscriptions|Groceries|Investments|Transport|Others","type":"debit|credit"}
+        content: `You are a financial SMS parser for Indian banks. Extract transaction details from ANY Indian bank SMS format.
+
+Indian banks and their SMS formats you must handle:
+- BOB: "Rs.80.00 Dr. from A/C XXXXXXXX1234"
+- HDFC: "Rs.500 debited from a/c **1234"
+- SBI: "Your A/c XX1234 debited Rs 1000"
+- ICICI: "ICICI Bank Acct XX1234 debited INR 200"
+- Axis: "INR 300.00 debited from Axis Bank Acct"
+- PhonePe SMS: "PhonePe transaction of Rs.80"
+- GPay: "Google Pay: Rs 150 paid to"
+- Paytm: "Paytm payment of Rs.250"
+
+Rules:
+1. "Dr." or "debited" or "paid" = money going OUT (capture this)
+2. "Cr." or "credited" or "received" = money coming IN (skip unless salary)
+3. Extract: amount (number only), merchant (UPI ID or merchant name), category
+4. For UPI IDs like "omkarne789@ybl" → merchant = the name before @
+5. ALWAYS strip: account balance, account numbers, OTP
+6. If "AvlBal" or "Available Balance" appears → remove it completely
+
 Categories:
 - Food Delivery: Swiggy, Zomato, Dunzo
 - Shopping: Amazon, Flipkart, Myntra, Meesho
@@ -44,7 +62,10 @@ Categories:
 - Groceries: Blinkit, Zepto, BigBasket, DMart
 - Investments: SIP, MF, mutual fund, stocks
 - Transport: Uber, Ola, Metro, IRCTC
-- Others: everything else`,
+- Others: everything else including UPI transfers
+
+Respond ONLY in this exact JSON format, no explanation, no markdown:
+{"isTransaction":true,"amount":80,"merchant":"Omkar (UPI)","category":"Others","type":"debit"}`,
       },
       {
         role: "user",
