@@ -19,52 +19,57 @@ const supabase = createClient(
 // ── HELPER: Strip sensitive info before sending to AI ────────────
 function sanitizeSMS(smsBody) {
   return smsBody
-    .replace(/Bal(ance)?:?\s*Rs\.?\s*[\d,]+/gi, "") // remove balance
-    .replace(/Avl\.?\s*Bal\.?:?\s*Rs\.?\s*[\d,]+/gi, "") // remove available balance
-    .replace(/A\/c\s*[X\d]+/gi, "A/c XXXX") // mask account number
+    .replace(/Bal(ance)?:?\s*Rs\.?\s*[\d,]+(\.\d+)?/gi, "")
+    .replace(/Avl\.?\s*Bal\.?:?\s*Rs\.?\s*[\d,]+(\.\d+)?/gi, "")
+    .replace(/AvlBal:Rs[\d,.]+/gi, "")
+    .replace(/Available\s*Balance:?\s*Rs\.?\s*[\d,]+(\.\d+)?/gi, "")
+    .replace(/A\/c\s*[X\d]+/gi, "A/c XXXX")
+    .replace(/AC\s*[X\d]+/gi, "AC XXXX")
+    .replace(/\d{9,}/g, "XXXXXXXX")
     .trim();
 }
 
-// ── HELPER: Parse SMS using Groq AI ─────────────────────────────
+// ── HELPER: Parse SMS using Groq AI ──────────────────────────────
 async function parseSMS(smsBody) {
   const sanitized = sanitizeSMS(smsBody);
 
   const response = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      
-        {
+      {
         role: "system",
         content: `You are a financial SMS parser for Indian banks. Extract transaction details from ANY Indian bank SMS format.
 
 Indian banks and their SMS formats you must handle:
-- BOB: "Rs.80.00 Dr. from A/C XXXXXXXX1234"
-- HDFC: "Rs.500 debited from a/c **1234"
-- SBI: "Your A/c XX1234 debited Rs 1000"
-- ICICI: "ICICI Bank Acct XX1234 debited INR 200"
-- Axis: "INR 300.00 debited from Axis Bank Acct"
-- PhonePe SMS: "PhonePe transaction of Rs.80"
-- GPay: "Google Pay: Rs 150 paid to"
-- Paytm: "Paytm payment of Rs.250"
+- BOB: "Rs.80.00 Dr. from A/C XXXXXXXX1234 and Cr. to merchant@ybl"
+- HDFC: "Rs.500 debited from a/c **1234 to VPA merchant@paytm"
+- SBI: "Your A/c XX1234 debited Rs 1000 and credited to merchant"
+- ICICI: "ICICI Bank Acct XX1234 debited INR 200.00"
+- Axis: "INR 300.00 debited from Axis Bank Acct XX1234"
+- Kotak: "Rs.150 debited from Kotak Bank A/c"
+- PhonePe SMS: "PhonePe: Rs.80 paid to merchant"
+- GPay: "Google Pay: Rs 150 paid to merchant"
+- Paytm: "Paytm: Rs.250 paid to merchant"
 
 Rules:
-1. "Dr." or "debited" or "paid" = money going OUT (capture this)
-2. "Cr." or "credited" or "received" = money coming IN (skip unless salary)
-3. Extract: amount (number only), merchant (UPI ID or merchant name), category
-4. For UPI IDs like "omkarne789@ybl" → merchant = the name before @
-5. ALWAYS strip: account balance, account numbers, OTP
-6. If "AvlBal" or "Available Balance" appears → remove it completely
+1. "Dr." or "debited" or "paid" or "spent" = money going OUT — CAPTURE this
+2. "Cr." or "credited" or "received" = money coming IN — SKIP (return isTransaction: false)
+3. Extract: amount as a plain number, merchant name or UPI ID
+4. For UPI IDs like "omkarne789@ybl" → merchant = "Omkar (UPI)"
+5. For UPI IDs like "zomato@icici" → merchant = "Zomato"
+6. ALWAYS ignore: account balance, account numbers, reference numbers
+7. If SMS has BOTH Dr. and Cr. — it is a debit transaction, focus on the Dr. amount
 
-Categories:
-- Food Delivery: Swiggy, Zomato, Dunzo
-- Shopping: Amazon, Flipkart, Myntra, Meesho
-- Subscriptions: Netflix, Spotify, Hotstar, Prime
-- Groceries: Blinkit, Zepto, BigBasket, DMart
-- Investments: SIP, MF, mutual fund, stocks
-- Transport: Uber, Ola, Metro, IRCTC
-- Others: everything else including UPI transfers
+Categories (pick the best match):
+- Food Delivery: Swiggy, Zomato, Dunzo, swiggy, zomato
+- Shopping: Amazon, Flipkart, Myntra, Meesho, amazon, flipkart
+- Subscriptions: Netflix, Spotify, Hotstar, Prime, JioCinema
+- Groceries: Blinkit, Zepto, BigBasket, DMart, grofers
+- Investments: SIP, MF, mutual fund, stocks, zerodha, groww
+- Transport: Uber, Ola, Metro, IRCTC, rapido, redbus
+- Others: everything else including personal UPI transfers
 
-Respond ONLY in this exact JSON format, no explanation, no markdown:
+Respond ONLY in this exact JSON format, no explanation, no markdown, nothing else:
 {"isTransaction":true,"amount":80,"merchant":"Omkar (UPI)","category":"Others","type":"debit"}`,
       },
       {
@@ -91,16 +96,21 @@ app.post("/api/sms", async (req, res) => {
   try {
     const { body, timestamp, userId } = req.body;
 
+    if (!body) {
+      return res.json({ skipped: true, reason: "Empty SMS body" });
+    }
+
     // Skip non-transaction SMS
-    const isTransaction = /debited|credited|Rs\.|INR|UPI|payment/i.test(body);
+    const isTransaction = /debited|credited|Rs\.|INR|UPI|payment|Dr\.|Cr\./i.test(body);
     if (!isTransaction) {
       return res.json({ skipped: true, reason: "Not a transaction SMS" });
     }
 
     // Parse with Groq AI
     const parsed = await parseSMS(body);
-    if (!parsed.amount) {
-      return res.json({ skipped: true, reason: "Could not extract amount" });
+
+    if (!parsed.isTransaction || !parsed.amount) {
+      return res.json({ skipped: true, reason: "Could not extract transaction details" });
     }
 
     // Get month name
@@ -127,7 +137,7 @@ app.post("/api/sms", async (req, res) => {
 
     if (error) throw error;
 
-    // Check budget and send WhatsApp alert if needed
+    // Check budget and send alert if needed
     if (userId) {
       await checkBudgetAlert(userId, parsed.category, parsed.amount);
     }
@@ -148,8 +158,12 @@ app.get("/api/transactions/:userId", async (req, res) => {
     let query = supabase
       .from("transactions")
       .select("*")
-      .eq("user_id", userId)
       .order("created_at", { ascending: false });
+
+    // If userId is not "null", filter by it
+    if (userId && userId !== "null") {
+      query = query.eq("user_id", userId);
+    }
 
     if (month) query = query.eq("month", month);
 
@@ -167,7 +181,6 @@ app.get("/api/insights/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Get last 3 months of transactions
     const threeMonthsAgo = new Date();
     threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
 
@@ -179,7 +192,6 @@ app.get("/api/insights/:userId", async (req, res) => {
 
     if (error) throw error;
 
-    // Group by month and category
     const byMonth = {};
     txns.forEach((t) => {
       if (!byMonth[t.month]) byMonth[t.month] = {};
@@ -187,7 +199,6 @@ app.get("/api/insights/:userId", async (req, res) => {
         (byMonth[t.month][t.category] || 0) + t.amount;
     });
 
-    // Generate insights
     const insights = [];
     const months = Object.keys(byMonth);
 
@@ -235,7 +246,7 @@ app.post("/api/user", async (req, res) => {
   }
 });
 
-// ── HELPER: Check budget and alert via WhatsApp ──────────────────
+// ── HELPER: Check budget and alert ───────────────────────────────
 async function checkBudgetAlert(userId, category, newAmount) {
   try {
     const { data: user } = await supabase
@@ -247,11 +258,7 @@ async function checkBudgetAlert(userId, category, newAmount) {
     if (!user?.budgets?.[category] || !user?.whatsapp) return;
 
     const now = new Date();
-    const monthStart = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      1
-    ).toISOString();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
 
     const { data: txns } = await supabase
       .from("transactions")
@@ -260,15 +267,11 @@ async function checkBudgetAlert(userId, category, newAmount) {
       .eq("category", category)
       .gte("created_at", monthStart);
 
-    const totalSpent =
-      (txns || []).reduce((s, t) => s + t.amount, 0) + newAmount;
+    const totalSpent = (txns || []).reduce((s, t) => s + t.amount, 0) + newAmount;
     const budget = user.budgets[category];
 
     if (totalSpent > budget * 0.9 && process.env.TWILIO_SID !== "fill_later") {
-      const twilio = require("twilio")(
-        process.env.TWILIO_SID,
-        process.env.TWILIO_TOKEN
-      );
+      const twilio = require("twilio")(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
       await twilio.messages.create({
         from: "whatsapp:+14155238886",
         to: `whatsapp:${user.whatsapp}`,
@@ -280,42 +283,19 @@ async function checkBudgetAlert(userId, category, newAmount) {
   }
 }
 
-// ── CRON: Weekly WhatsApp digest every Monday 9am ────────────────
+// ── CRON: Weekly digest every Monday 9am ─────────────────────────
 cron.schedule("0 9 * * MON", async () => {
   if (process.env.TWILIO_SID === "fill_later") return;
-
   try {
-    const { data: users } = await supabase
-      .from("users")
-      .select("*")
-      .not("whatsapp", "is", null);
-
-    const twilio = require("twilio")(
-      process.env.TWILIO_SID,
-      process.env.TWILIO_TOKEN
-    );
-
+    const { data: users } = await supabase.from("users").select("*").not("whatsapp", "is", null);
+    const twilio = require("twilio")(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
     for (const user of users || []) {
-      const weekAgo = new Date(
-        Date.now() - 7 * 24 * 60 * 60 * 1000
-      ).toISOString();
-      const { data: txns } = await supabase
-        .from("transactions")
-        .select("*")
-        .eq("user_id", user.id)
-        .gte("created_at", weekAgo);
-
+      const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: txns } = await supabase.from("transactions").select("*").eq("user_id", user.id).gte("created_at", weekAgo);
       const byCategory = {};
-      (txns || []).forEach((t) => {
-        byCategory[t.category] = (byCategory[t.category] || 0) + t.amount;
-      });
-
+      (txns || []).forEach((t) => { byCategory[t.category] = (byCategory[t.category] || 0) + t.amount; });
       const total = Object.values(byCategory).reduce((s, v) => s + v, 0);
-      const lines = Object.entries(byCategory)
-        .sort((a, b) => b[1] - a[1])
-        .map(([cat, amt]) => `• ${cat}: ₹${amt.toLocaleString("en-IN")}`)
-        .join("\n");
-
+      const lines = Object.entries(byCategory).sort((a, b) => b[1] - a[1]).map(([cat, amt]) => `• ${cat}: ₹${amt.toLocaleString("en-IN")}`).join("\n");
       await twilio.messages.create({
         from: "whatsapp:+14155238886",
         to: `whatsapp:${user.whatsapp}`,
